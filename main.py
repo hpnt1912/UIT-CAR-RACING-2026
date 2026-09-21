@@ -1,15 +1,17 @@
 """
 main.py
 Code chính điều khiển xe tự hành cho UIT CAR RACING - Bảng chuyên nghiệp.
+Xe đi GIỮA bề rộng đường phát hiện được (không bám lề phải/trái).
 
 Luồng xử lý mỗi frame:
     1. Lấy ảnh camera thô từ Unity (GetRaw())
     2. Đưa ảnh qua model segmentation (đã train, export ONNX) để lấy mask
        phân biệt "đường đi được" và "không phải đường"
     3. Tính sai số (error) giữa tâm đường và tâm ảnh
-    4. Đưa error qua bộ điều khiển PID để tính góc lái
-    5. Điều chỉnh tốc độ theo góc lái (cua gấp thì chậm lại)
-    6. Gửi lệnh điều khiển xuống Unity (AVControl)
+    4. Làm mượt error, đưa qua bộ điều khiển PID để tính góc lái
+    5. Giới hạn tốc độ thay đổi góc lái mỗi frame (tránh giật đột ngột)
+    6. Điều chỉnh tốc độ theo góc lái (cua gấp thì chậm lại)
+    7. Gửi lệnh điều khiển xuống Unity (AVControl)
 
 Yêu cầu trước khi chạy:
     - Đã huấn luyện model bằng train.py và có file 'lane_seg.onnx'
@@ -25,35 +27,43 @@ import numpy as np
 import onnxruntime as ort
 
 from ucr_lib import GetStatus, GetRaw, AVControl, CloseSocket
-from utils import PID, compute_lane_error, adaptive_speed, clip_control
+from utils import PID, compute_lane_error, adaptive_speed, clip_control, ErrorSmoother, rate_limit_angle
+from live_view import LiveViewer
 
 # ===================== CẤU HÌNH =====================
 MODEL_PATH = "lane_seg.onnx"
-IMG_SIZE = 128          # phải khớp với img-size lúc train (giảm từ 224 để tăng tốc)
-ROAD_CLASS = 1          # nhãn class ứng với "đường đi được"
-MAX_SPEED = 20.0        # giới hạn tốc độ theo luật thi đấu
-MAX_ANGLE = 25.0        # giới hạn góc lái theo luật thi đấu
+IMG_SIZE = 128           # phải khớp với img-size lúc train
+ROAD_CLASS = 1           # nhãn class ứng với "đường đi được"
+MAX_SPEED = 25.0         # giới hạn tốc độ THỰC TẾ dùng lúc test (luật cho phép tối đa 90)
+MAX_ANGLE = 25.0         # giới hạn góc lái theo luật thi đấu
 
-# Hệ số PID - CẦN TỰ TINH CHỈNH (tune) lại trên map mẫu thực tế,
-# đây chỉ là giá trị khởi điểm hợp lý.
-PID_KP = 0.35
+# Hệ số PID - CẦN TỰ TINH CHỈNH (tune) lại trên map mẫu thực tế.
+PID_KP = 0.30
 PID_KI = 0.0002
-PID_KD = 0.08
+PID_KD = 0.10
 
-# Vị trí mục tiêu trong bề rộng đường (0.5 = đi giữa, >0.5 = lệch phải).
-# Thể lệ vòng sơ loại đã ghi "Đường 2 chiều" -> CẦN giữ bên phải, không đi giữa.
-# 0.5 chỉ dùng tạm khi chưa xác nhận map có phải 2 chiều thật sự hay không.
-# Tăng dần (0.6 -> 0.7 -> 0.75...) và quan sát trực tiếp lúc xe chạy để tinh chỉnh,
-# vì đây là xấp xỉ hình học (mask chưa phân biệt vạch đứt ở giữa 2 làn).
-KEEP_RIGHT_RATIO = 0.5  # TODO: đổi thành ~0.7-0.78 sau khi xác nhận + quan sát thực tế
+# Nếu mất dấu đường (không tìm thấy pixel đường ở dòng xét) trong bao nhiêu
+# frame liên tiếp thì coi là mất làn thật sự, chuyển sang chế độ an toàn (giảm tốc mạnh)
+MAX_LOST_FRAMES = 8
 
-# Tắt hiển thị debug khi chạy thi đấu chính thức -> giảm overhead, an toàn hơn cho
-# giới hạn FPS 60 của máy chấm. Chỉ bật True nếu máy đang chạy CÓ giao diện đồ họa
-# (không phải container headless) để xem cửa sổ camera/mask trực tiếp.
-DEBUG_DISPLAY = False
+# Làm mượt tín hiệu error để giảm ảnh hưởng nhiễu tức thời từ model (model mới
+# train từ ít ảnh dễ "nhìn nhầm" 1-2 frame, khiến biên đường tính sai đột ngột).
+ERROR_SMOOTHING_ALPHA = 0.4
 
-# Vì container không có GUI, dùng cách này để vẫn "nhìn thấy" xe đang lái ra sao:
-# lưu 1 ảnh debug (ghép ảnh gốc + mask + speed/angle) ra file mỗi N frame.
+# Giới hạn góc lái được phép thay đổi tối đa giữa 2 frame liên tiếp (độ/frame).
+# Lớp bảo vệ cuối: dù error có nhảy vọt bất thường vì lý do gì, góc lái thực
+# tế gửi xuống xe vẫn không thể "giật" đột ngột.
+MAX_ANGLE_DELTA_PER_FRAME = 6.0
+
+# Xem trực tiếp (gần real-time) ảnh camera + mask qua trình duyệt, không cần
+# GUI trong container. Mở http://localhost:<LIVE_VIEW_PORT> trên máy host,
+# hoặc dùng tab "Ports" trong VS Code nếu đang chạy Dev Container.
+LIVE_VIEW_ENABLED = True
+LIVE_VIEW_PORT = 8080
+LIVE_VIEW_EVERY = 3  # cập nhật ảnh live view mỗi N frame (nhỏ hơn SAVE_DEBUG_EVERY để mượt hơn)
+
+# Vì container không có GUI, dùng cách này để vẫn lưu lại lịch sử: lưu 1 ảnh
+# debug (ghép ảnh gốc + mask + speed/angle) ra file mỗi N frame.
 # Đặt None để tắt hẳn (không lưu gì, dùng khi thi đấu chính thức để tối đa tốc độ).
 SAVE_DEBUG_EVERY = 30
 DEBUG_DIR = "debug_frames"
@@ -62,9 +72,11 @@ DEBUG_DIR = "debug_frames"
 # (giây) để tránh chạy vô hạn khi bạn quên tắt. Đặt None để chạy vô hạn (không tự dừng).
 MAX_RUNTIME_SEC = 300
 
-# Nếu mất dấu đường (không tìm thấy pixel đường ở dòng xét) trong bao nhiêu
-# frame liên tiếp thì coi là mất làn thật sự, chuyển sang chế độ an toàn (giảm tốc mạnh)
-MAX_LOST_FRAMES = 8
+# Tắt hiển thị debug khi chạy thi đấu chính thức -> giảm overhead, an toàn hơn cho
+# giới hạn FPS 60 của máy chấm. Chỉ bật True nếu máy đang chạy CÓ giao diện đồ họa
+# (không phải container headless) để xem cửa sổ camera/mask trực tiếp.
+DEBUG_DISPLAY = False
+# =====================================================
 
 
 def load_model(model_path: str) -> ort.InferenceSession:
@@ -103,19 +115,25 @@ def mask_to_color(mask: np.ndarray) -> np.ndarray:
 def main():
     session = load_model(MODEL_PATH)
     pid_steer = PID(kp=PID_KP, ki=PID_KI, kd=PID_KD)
+    error_smoother = ErrorSmoother(alpha=ERROR_SMOOTHING_ALPHA)
 
     last_valid_error = 0.0
     lost_frame_count = 0
     last_time = time.time()
     run_start_time = time.time()
     frame_counter = 0
+    last_angle = 0.0
+
+    fps_window = []
+    FPS_LOG_EVERY = 60
 
     if SAVE_DEBUG_EVERY:
         os.makedirs(DEBUG_DIR, exist_ok=True)
 
-    # Đo FPS trung bình để tự kiểm tra có đáp ứng giới hạn 60 FPS của máy chấm không
-    fps_window = []
-    FPS_LOG_EVERY = 60  # in trung bình FPS mỗi 60 frame
+    live_viewer = None
+    if LIVE_VIEW_ENABLED:
+        live_viewer = LiveViewer(port=LIVE_VIEW_PORT)
+        live_viewer.start()
 
     print("[UCR 2026] Bắt đầu điều khiển xe.")
     if DEBUG_DISPLAY:
@@ -135,22 +153,17 @@ def main():
             now = time.time()
             dt = now - last_time
             last_time = now
-            # Chặn dt bất thường (ví dụ lúc mới khởi động, hoặc bị treo tạm thời)
-            # để tránh đạo hàm PID nhảy vọt sai lệch.
             dt = min(max(dt, 1e-3), 0.2)
 
             state = GetStatus()
             raw_image = GetRaw()
 
             mask = infer_mask(session, raw_image, IMG_SIZE)
-            error, row_used = compute_lane_error(
+            error, row_used, lane_debug = compute_lane_error(
                 mask, road_class=ROAD_CLASS, row_ratio=0.75,
-                keep_right_ratio=KEEP_RIGHT_RATIO,
             )
 
             if error is None:
-                # Không thấy đường ở dòng xét -> dùng lại error cũ, giảm tốc
-                # để tránh đâm ra ngoài đường trong lúc "mù" tạm thời.
                 lost_frame_count += 1
                 error = last_valid_error
                 print(f"[!] Mất dấu đường ({lost_frame_count} frame liên tiếp) - dùng error cũ: {error:.1f}")
@@ -158,11 +171,12 @@ def main():
                 lost_frame_count = 0
                 last_valid_error = error
 
-            angle = pid_steer.compute(error, dt=dt)  # dùng dt ĐO THỰC TẾ, không hardcode
+            smoothed_error = error_smoother.update(error)
+            raw_angle = pid_steer.compute(smoothed_error, dt=dt)
+            angle = rate_limit_angle(raw_angle, last_angle, MAX_ANGLE_DELTA_PER_FRAME)
+            last_angle = angle
 
             if lost_frame_count >= MAX_LOST_FRAMES:
-                # Mất làn quá lâu -> ưu tiên an toàn: đi chậm, giữ nguyên
-                # hướng lái cuối cùng thay vì đoán liều.
                 speed = MAX_SPEED * 0.25
             else:
                 speed = adaptive_speed(angle, max_speed=MAX_SPEED)
@@ -172,7 +186,7 @@ def main():
             AVControl(speed, angle)
             frame_counter += 1
 
-            # ---- Theo dõi FPS thực tế để đối chiếu với giới hạn 60 FPS của máy chấm ----
+            # ---- Theo dõi FPS thực tế ----
             frame_time = time.time() - now
             fps_window.append(frame_time)
             if len(fps_window) >= FPS_LOG_EVERY:
@@ -181,11 +195,29 @@ def main():
                 status = "OK" if avg_fps >= 55 else "CẢNH BÁO - có thể không đáp ứng kịp 60 FPS"
                 print(f"[FPS] Trung bình {avg_fps:.1f} FPS trong {FPS_LOG_EVERY} frame gần nhất ({status})")
                 fps_window = []
-            # -----------------------------------------------------------------------------
 
-            # ---- Lưu ảnh debug định kỳ ra file (dùng khi container không có GUI) ----
-            if SAVE_DEBUG_EVERY and frame_counter % SAVE_DEBUG_EVERY == 0:
+            # ---- Tính overlay debug cho live view / lưu file ----
+            need_overlay = (
+                (LIVE_VIEW_ENABLED and frame_counter % LIVE_VIEW_EVERY == 0) or
+                (SAVE_DEBUG_EVERY and frame_counter % SAVE_DEBUG_EVERY == 0)
+            )
+            if need_overlay:
                 debug_img = raw_image.copy()
+                h_raw, w_raw = debug_img.shape[:2]
+
+                if lane_debug is not None:
+                    scale_x = w_raw / IMG_SIZE
+                    scale_y = h_raw / IMG_SIZE
+                    y_line = int(row_used * scale_y)
+                    left_x = int(lane_debug["left"] * scale_x)
+                    right_x = int(lane_debug["right"] * scale_x)
+                    target_x_raw = int(lane_debug["target"] * scale_x)
+
+                    cv2.line(debug_img, (left_x, y_line - 5), (left_x, y_line + 5), (255, 200, 0), 2)
+                    cv2.line(debug_img, (right_x, y_line - 5), (right_x, y_line + 5), (255, 200, 0), 2)
+                    cv2.line(debug_img, (w_raw // 2, 0), (w_raw // 2, h_raw), (0, 255, 255), 1)
+                    cv2.circle(debug_img, (target_x_raw, y_line), 6, (0, 0, 255), -1)
+
                 cv2.putText(debug_img, f"speed={speed:.1f} angle={angle:.1f} err={error:.1f}",
                             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 mask_color = mask_to_color(mask)
@@ -194,20 +226,19 @@ def main():
                     interpolation=cv2.INTER_NEAREST
                 )
                 combined = np.hstack([debug_img, mask_color_resized])
-                cv2.imwrite(f"{DEBUG_DIR}/frame_{frame_counter:06d}.png", combined)
-            # --------------------------------------------------------------------------
 
-            # ---- Debug hiển thị trực tiếp: CHỈ dùng khi máy có GUI thật, không dùng
-            # trong container headless (sẽ lỗi qt.qpa.xcb). Luôn để False khi thi
-            # đấu chính thức để tối đa tốc độ. ----
+                if live_viewer is not None and frame_counter % LIVE_VIEW_EVERY == 0:
+                    live_viewer.update(combined)
+
+                if SAVE_DEBUG_EVERY and frame_counter % SAVE_DEBUG_EVERY == 0:
+                    cv2.imwrite(f"{DEBUG_DIR}/frame_{frame_counter:06d}.png", combined)
+
             if DEBUG_DISPLAY:
                 cv2.imshow("UCR 2026 - Front Camera", debug_img)
                 cv2.imshow("Segmentation Mask", mask_color)
-
                 key = cv2.waitKey(1)
                 if key == ord('q'):
                     break
-            # --------------------------------------------------------------------------
 
     except KeyboardInterrupt:
         print("\n[UCR 2026] Nhận Ctrl+C, dừng lại.")
@@ -217,6 +248,8 @@ def main():
     finally:
         print('\n[UCR 2026] Đóng kết nối...')
         CloseSocket()
+        if live_viewer is not None:
+            live_viewer.stop()
         if DEBUG_DISPLAY:
             cv2.destroyAllWindows()
         print("[UCR 2026] Đã thoát.")

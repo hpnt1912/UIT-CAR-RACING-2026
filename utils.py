@@ -33,27 +33,24 @@ class PID:
         return output
 
 
-def compute_lane_error(mask: np.ndarray, road_class: int = 1, row_ratio: float = 0.75,
-                        keep_right_ratio: float = 0.5):
+def compute_lane_error(mask: np.ndarray, road_class: int = 1, row_ratio: float = 0.75):
     """
-    Tính sai số (error) giữa vị trí MỤC TIÊU trên đường và tâm ảnh, dựa trên mask segmentation.
+    Tính sai số (error) giữa TÂM đường và tâm ảnh, dựa trên mask segmentation.
+    Xe sẽ cố đi GIỮA bề rộng đường phát hiện được (không bám lề phải/trái).
 
     mask: ảnh 2D (H, W) với giá trị mỗi pixel là class (0 = nền, 1 = đường, ...)
-    road_class: giá trị class ứng với "đường đi được" (gộp cả 2 chiều/2 làn nếu có)
-    row_ratio: xét dòng ảnh ở vị trí này (0.0 = trên cùng, 1.0 = dưới cùng)
+    road_class: giá trị class ứng với "đường đi được"
+    row_ratio: xét dòng ảnh ở vị trí này (0.0 = trên cùng, 1.0 = dưới cùng).
+               Nên lấy gần đáy ảnh (gần xe) để phản ứng nhanh, nhưng không
+               quá sát đáy để tránh nhiễu do nắp capo/thân xe che khuất.
 
-    keep_right_ratio: vị trí mục tiêu trong bề rộng đường, tính từ mép TRÁI sang mép PHẢI:
-        0.5  -> đi giữa toàn bộ bề rộng đường (dùng cho đường 1 chiều / không cần giữ làn)
-        0.75 -> đi lệch về nửa bên phải (gần đúng cho đường 2 chiều, giữ bên phải vạch giữa,
-                giả định 2 làn rộng bằng nhau: tâm làn phải nằm ở khoảng 75% bề rộng từ mép trái)
-        Cần tinh chỉnh giá trị này bằng cách quan sát trực tiếp khi xe chạy map 2 chiều,
-        vì mask hiện tại gộp chung cả 2 làn (chưa phân biệt vạch đứt ở giữa) - đây chỉ là
-        xấp xỉ hình học, không phải phát hiện vạch tim đường thật sự.
-
-    Trả về: (error, row_used)
-        error > 0: mục tiêu lệch về bên phải tâm ảnh -> cần lái phải
-        error < 0: mục tiêu lệch về bên trái tâm ảnh -> cần lái trái
-        Nếu không tìm thấy đường ở dòng đó, trả về None để main.py xử lý fallback.
+    Trả về: (error, row_used, debug_info)
+        error > 0: đường lệch về bên phải tâm ảnh -> cần lái phải
+        error < 0: đường lệch về bên trái tâm ảnh -> cần lái trái
+        debug_info: {"left", "right", "target"} (toạ độ pixel trong không gian
+            mask) - dùng để vẽ trực quan lên ảnh debug/live view.
+        Nếu không tìm thấy đường ở dòng đó, trả về (None, row, None) để
+        main.py xử lý fallback.
     """
     h, w = mask.shape[:2]
     row = int(h * row_ratio)
@@ -63,17 +60,53 @@ def compute_lane_error(mask: np.ndarray, road_class: int = 1, row_ratio: float =
     road_pixels = np.where(line == road_class)[0]
 
     if len(road_pixels) == 0:
-        return None, row
+        return None, row, None
 
     left_edge = road_pixels.min()
     right_edge = road_pixels.max()
-
-    # Vị trí mục tiêu trong bề rộng đường, thay vì luôn lấy đúng tâm (0.5)
-    target_x = left_edge + (right_edge - left_edge) * keep_right_ratio
+    target_x = (left_edge + right_edge) / 2.0  # luôn đi giữa bề rộng đường
 
     img_center = w / 2.0
     error = target_x - img_center
-    return float(error), row
+    debug_info = {"left": int(left_edge), "right": int(right_edge), "target": float(target_x)}
+    return float(error), row, debug_info
+
+
+class ErrorSmoother:
+    """
+    Làm mượt tín hiệu error bằng exponential moving average (EMA), giúp giảm
+    ảnh hưởng của các frame bị nhiễu tức thời (model segmentation "nhìn nhầm"
+    1-2 frame khiến biên đường bị tính sai đột ngột) - nguyên nhân phổ biến
+    gây hiện tượng xe đang đi thẳng bỗng rẽ gắt bất thường.
+    """
+
+    def __init__(self, alpha: float = 0.4):
+        # alpha càng nhỏ càng mượt (ít nhạy với thay đổi tức thời) nhưng phản
+        # ứng chậm hơn với lệch làn thật; alpha càng lớn càng nhạy nhưng dễ
+        # bị nhiễu ảnh hưởng. 0.3-0.5 là khoảng hợp lý để bắt đầu.
+        self.alpha = alpha
+        self.value = None
+
+    def update(self, new_value: float) -> float:
+        if self.value is None:
+            self.value = new_value
+        else:
+            self.value = self.alpha * new_value + (1 - self.alpha) * self.value
+        return self.value
+
+    def reset(self):
+        self.value = None
+
+
+def rate_limit_angle(new_angle: float, prev_angle: float, max_delta: float) -> float:
+    """
+    Giới hạn mức thay đổi góc lái tối đa giữa 2 frame liên tiếp, để dù error
+    tính ra có nhảy vọt bất thường (do model nhiễu 1 frame), góc lái thực tế
+    gửi xuống xe vẫn thay đổi từ từ, không bị "giật" đột ngột gây chạm vạch.
+    """
+    delta = new_angle - prev_angle
+    delta = np.clip(delta, -max_delta, max_delta)
+    return prev_angle + delta
 
 
 def adaptive_speed(angle: float, max_speed: float = 90.0, min_speed_ratio: float = 0.35) -> float:
