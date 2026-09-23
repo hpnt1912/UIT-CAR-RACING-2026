@@ -34,12 +34,12 @@ from live_view import LiveViewer
 MODEL_PATH = "lane_seg.onnx"
 IMG_SIZE = 128           # phải khớp với img-size lúc train
 ROAD_CLASS = 1           # nhãn class ứng với "đường đi được"
-MAX_SPEED = 25.0         # giới hạn tốc độ THỰC TẾ dùng lúc test (luật cho phép tối đa 90)
+MAX_SPEED = 28.0         # giới hạn tốc độ THỰC TẾ dùng lúc test (luật cho phép tối đa 90)
 MAX_ANGLE = 25.0         # giới hạn góc lái theo luật thi đấu
 
 # Hệ số PID - CẦN TỰ TINH CHỈNH (tune) lại trên map mẫu thực tế.
-PID_KP = 0.30
-PID_KI = 0.0002
+PID_KP = 0.30 # toc do phan ung
+PID_KI = 0.0002 # triet tieu sai so
 PID_KD = 0.10
 
 # Nếu mất dấu đường (không tìm thấy pixel đường ở dòng xét) trong bao nhiêu
@@ -124,6 +124,9 @@ def main():
     frame_counter = 0
     last_angle = 0.0
 
+    # Tần suất in thông tin terminal
+    PRINT_EVERY = 5
+
     fps_window = []
     FPS_LOG_EVERY = 60
 
@@ -166,7 +169,6 @@ def main():
             if error is None:
                 lost_frame_count += 1
                 error = last_valid_error
-                print(f"[!] Mất dấu đường ({lost_frame_count} frame liên tiếp) - dùng error cũ: {error:.1f}")
             else:
                 lost_frame_count = 0
                 last_valid_error = error
@@ -185,6 +187,16 @@ def main():
 
             AVControl(speed, angle)
             frame_counter += 1
+
+            # ---- Hiển thị thông số điều khiển ----
+            if frame_counter % PRINT_EVERY == 0:
+                print(
+                    f"Frame {frame_counter:5d} | "
+                    f"Speed: {speed:5.1f} | "
+                    f"Error: {error:6.1f} | "
+                    f"Angle: {angle:6.1f} | "
+                    f"Lost: {lost_frame_count}"
+                )
 
             # ---- Theo dõi FPS thực tế ----
             frame_time = time.time() - now
