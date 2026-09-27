@@ -38,9 +38,9 @@ MAX_SPEED = 28.0         # giới hạn tốc độ THỰC TẾ dùng lúc test 
 MAX_ANGLE = 25.0         # giới hạn góc lái theo luật thi đấu
 
 # Hệ số PID - CẦN TỰ TINH CHỈNH (tune) lại trên map mẫu thực tế.
-PID_KP = 0.30 # toc do phan ung
+PID_KP = 0.20 # toc do phan ung
 PID_KI = 0.0002 # triet tieu sai so
-PID_KD = 0.10
+PID_KD = 0.1
 
 # Nếu mất dấu đường (không tìm thấy pixel đường ở dòng xét) trong bao nhiêu
 # frame liên tiếp thì coi là mất làn thật sự, chuyển sang chế độ an toàn (giảm tốc mạnh)
@@ -53,19 +53,39 @@ ERROR_SMOOTHING_ALPHA = 0.4
 # Giới hạn góc lái được phép thay đổi tối đa giữa 2 frame liên tiếp (độ/frame).
 # Lớp bảo vệ cuối: dù error có nhảy vọt bất thường vì lý do gì, góc lái thực
 # tế gửi xuống xe vẫn không thể "giật" đột ngột.
-MAX_ANGLE_DELTA_PER_FRAME = 6.0
+MAX_ANGLE_DELTA_PER_FRAME = 12.0
+
+# Bán kính cửa sổ tìm kiếm biên đường (tỉ lệ theo bề rộng ảnh), quanh vị trí
+# mục tiêu của frame TRƯỚC. Giúp "phớt lờ" nhánh rẽ tại ngã ba/ngã tư thay vì
+# bị hút theo nó. Bán kính nhỏ hơn = kiên định hơn với hướng cũ (nhưng nếu
+# quá nhỏ, xe khó theo kịp khi đường thật sự cong/lệch nhiều).
+SEARCH_RADIUS_RATIO = 0.35
+
+# Phát hiện đường ĐỘT NGỘT PHÌNH TO bất thường (dấu hiệu đặc trưng của ngã ba/
+# ngã tư, nơi mask "đường" bị gộp thêm nhánh rẽ) để CHỦ ĐỘNG khoá hướng lái
+# hiện tại, không tin vào dữ liệu frame đó. Đây là lớp bảo vệ BỔ SUNG, độc lập
+# với SEARCH_RADIUS_RATIO ở trên (không thay thế nhau, dùng cả 2 cùng lúc).
+#
+# WIDTH_SPIKE_RATIO: nếu bề rộng đường ở frame hiện tại > baseline * tỉ lệ
+# này, coi là bất thường (khả năng cao đang ở ngã ba) -> giữ nguyên hướng
+# lái cũ, không cập nhật gì từ frame đó.
+WIDTH_SPIKE_RATIO = 1.8
+# Tốc độ cập nhật baseline (EMA). Nhỏ hơn = baseline ổn định hơn, ít bị kéo
+# lệch bởi 1-2 frame bất thường; lớn hơn = baseline thích nghi nhanh hơn với
+# thay đổi bề rộng thật (ví dụ map có đoạn đường rộng/hẹp khác nhau).
+WIDTH_BASELINE_ALPHA = 0.05
 
 # Xem trực tiếp (gần real-time) ảnh camera + mask qua trình duyệt, không cần
 # GUI trong container. Mở http://localhost:<LIVE_VIEW_PORT> trên máy host,
 # hoặc dùng tab "Ports" trong VS Code nếu đang chạy Dev Container.
-LIVE_VIEW_ENABLED = True
+LIVE_VIEW_ENABLED = False
 LIVE_VIEW_PORT = 8080
 LIVE_VIEW_EVERY = 3  # cập nhật ảnh live view mỗi N frame (nhỏ hơn SAVE_DEBUG_EVERY để mượt hơn)
 
 # Vì container không có GUI, dùng cách này để vẫn lưu lại lịch sử: lưu 1 ảnh
 # debug (ghép ảnh gốc + mask + speed/angle) ra file mỗi N frame.
 # Đặt None để tắt hẳn (không lưu gì, dùng khi thi đấu chính thức để tối đa tốc độ).
-SAVE_DEBUG_EVERY = 30
+SAVE_DEBUG_EVERY = None
 DEBUG_DIR = "debug_frames"
 
 # Vì bản headless không có phím 'q' để dừng thủ công, tự dừng sau thời gian này
@@ -123,6 +143,11 @@ def main():
     run_start_time = time.time()
     frame_counter = 0
     last_angle = 0.0
+    last_target_x_mask = None  # vị trí mục tiêu (không gian mask) của frame trước,
+                                # dùng làm tâm cửa sổ tìm kiếm, giúp bỏ qua nhánh
+                                # rẽ tại ngã ba/ngã tư
+    baseline_width = None      # bề rộng đường "bình thường" trung bình (EMA),
+                                # dùng để phát hiện đường đột ngột phình to
 
     # Tần suất in thông tin terminal
     PRINT_EVERY = 5
@@ -163,15 +188,35 @@ def main():
 
             mask = infer_mask(session, raw_image, IMG_SIZE)
             error, row_used, lane_debug = compute_lane_error(
-                mask, road_class=ROAD_CLASS, row_ratio=0.75,
+                mask, road_class=ROAD_CLASS, row_ratio=0.72,
+                search_center=last_target_x_mask, search_radius_ratio=SEARCH_RADIUS_RATIO,
             )
 
-            if error is None:
-                lost_frame_count += 1
+            # ---- Phát hiện đường ĐỘT NGỘT PHÌNH TO (khả năng ở ngã ba/ngã tư) ----
+            width_spike_detected = False
+            if lane_debug is not None:
+                current_width = lane_debug["right"] - lane_debug["left"]
+
+                if baseline_width is None:
+                    baseline_width = current_width
+                elif current_width > baseline_width * WIDTH_SPIKE_RATIO:
+                    width_spike_detected = True
+                    # KHÔNG cập nhật baseline_width (tránh baseline bị kéo lệch lên
+                    # theo giá trị bất thường), KHÔNG cập nhật last_target_x_mask
+                    # (giữ nguyên "điểm neo" cũ để khoá hướng lái đang bám)
+                else:
+                    baseline_width = (
+                        (1 - WIDTH_BASELINE_ALPHA) * baseline_width
+                        + WIDTH_BASELINE_ALPHA * current_width
+                    )
+            
+            if width_spike_detected:
+                # Nghi ngờ đang ở ngã ba -> dùng lại error ổn định trước đó, phớt
+                # lờ kết quả tính được từ frame này (target_x có thể đã bị kéo
+                # lệch theo nhánh rẽ).
                 error = last_valid_error
-            else:
-                lost_frame_count = 0
-                last_valid_error = error
+            elif lane_debug is not None:
+                last_target_x_mask = lane_debug["target"]
 
             smoothed_error = error_smoother.update(error)
             raw_angle = pid_steer.compute(smoothed_error, dt=dt)
@@ -183,6 +228,25 @@ def main():
             else:
                 speed = adaptive_speed(angle, max_speed=MAX_SPEED)
 
+            # ========================================================
+            # --- CƠ CHẾ PHANH KHẨN CẤP & XOAY TRỤC KHI CUA CỰC GẮT ---
+            # ========================================================
+            EMERGENCY_ERROR = 40.0  # Ngưỡng báo động đỏ (lệch trên 45 pixel)
+            
+            if abs(error) > EMERGENCY_ERROR:
+                # 1. Bóp phanh đi cực chậm (chỉ 3.0 - 5.0) để triệt tiêu quán tính
+                speed = 0.0
+                
+                # 2. Ép vô lăng xoay kịch kim (bỏ qua mọi giới hạn làm mượt)
+                # Nếu error < 0 (lệch trái) -> bẻ hết lái trái. Ngược lại bẻ phải.
+                angle = -20 if error < 0 else 20
+                
+                # 3. Cập nhật lại bộ nhớ để khi thoát trạng thái này xe không bị giật
+                last_angle = angle
+                pid_steer.reset()       # Reset bộ nhớ PID
+                error_smoother.reset()  # Reset bộ nhớ chống nhiễu
+            # ========================================================
+
             speed, angle = clip_control(speed, angle, MAX_SPEED, MAX_ANGLE)
 
             AVControl(speed, angle)
@@ -190,12 +254,14 @@ def main():
 
             # ---- Hiển thị thông số điều khiển ----
             if frame_counter % PRINT_EVERY == 0:
+                spike_tag = " [SPIKE-NGA_BA]" if width_spike_detected else ""
                 print(
                     f"Frame {frame_counter:5d} | "
                     f"Speed: {speed:5.1f} | "
                     f"Error: {error:6.1f} | "
                     f"Angle: {angle:6.1f} | "
                     f"Lost: {lost_frame_count}"
+                    f"{spike_tag}"
                 )
 
             # ---- Theo dõi FPS thực tế ----

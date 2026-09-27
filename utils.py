@@ -33,7 +33,8 @@ class PID:
         return output
 
 
-def compute_lane_error(mask: np.ndarray, road_class: int = 1, row_ratio: float = 0.75):
+def compute_lane_error(mask: np.ndarray, road_class: int = 1, row_ratio: float = 0.75,
+                        search_center: float = None, search_radius_ratio: float = 0.25):
     """
     Tính sai số (error) giữa TÂM đường và tâm ảnh, dựa trên mask segmentation.
     Xe sẽ cố đi GIỮA bề rộng đường phát hiện được (không bám lề phải/trái).
@@ -43,6 +44,16 @@ def compute_lane_error(mask: np.ndarray, road_class: int = 1, row_ratio: float =
     row_ratio: xét dòng ảnh ở vị trí này (0.0 = trên cùng, 1.0 = dưới cùng).
                Nên lấy gần đáy ảnh (gần xe) để phản ứng nhanh, nhưng không
                quá sát đáy để tránh nhiễu do nắp capo/thân xe che khuất.
+
+    search_center, search_radius_ratio: nếu search_center được cung cấp (toạ độ
+        x, đơn vị pixel trong không gian mask, thường là target_x của frame
+        TRƯỚC), chỉ tìm biên đường trong cửa sổ quanh vị trí đó thay vì quét
+        toàn bộ bề rộng ảnh. Mục đích: tại ngã ba/ngã tư, khi mask "đường" bị
+        mở rộng thêm nhánh rẽ, quét toàn bộ bề rộng sẽ khiến biên bị kéo lệch
+        theo nhánh rẽ dù ta muốn xe đi thẳng. Giới hạn cửa sổ giúp "phớt lờ"
+        nhánh rẽ nằm ngoài phạm vi đang bám. Nếu không có pixel đường nào
+        trong cửa sổ, tự động fallback về quét toàn bộ bề rộng (ví dụ lúc
+        mới khởi động, hoặc đường thật sự đổi hướng đột ngột).
 
     Trả về: (error, row_used, debug_info)
         error > 0: đường lệch về bên phải tâm ảnh -> cần lái phải
@@ -61,6 +72,14 @@ def compute_lane_error(mask: np.ndarray, road_class: int = 1, row_ratio: float =
 
     if len(road_pixels) == 0:
         return None, row, None
+
+    if search_center is not None:
+        radius = w * search_radius_ratio
+        windowed = road_pixels[
+            (road_pixels >= search_center - radius) & (road_pixels <= search_center + radius)
+        ]
+        if len(windowed) > 0:
+            road_pixels = windowed
 
     left_edge = road_pixels.min()
     right_edge = road_pixels.max()
@@ -112,15 +131,22 @@ def rate_limit_angle(new_angle: float, prev_angle: float, max_delta: float) -> f
 def adaptive_speed(angle: float, max_speed: float = 90.0, min_speed_ratio: float = 0.35) -> float:
     """
     Giảm tốc khi cua gấp, tăng tốc khi đường thẳng.
-    angle: góc lái hiện tại (độ), giả sử trong khoảng [-25, 25]
+    Đã hạ mốc angle xuống để phanh nhạy hơn.
     """
     angle_abs = abs(angle)
-    if angle_abs > 15:
+    
+    # Góc lái > 9 độ: Đang ôm cua gắt -> Phanh mạnh (35% tốc độ)
+    if angle_abs > 9.0:
         ratio = min_speed_ratio
-    elif angle_abs > 8:
+        
+    # Góc lái > 4 độ: Chớm vào cua -> Hãm phanh nhẹ (60% tốc độ)
+    elif angle_abs > 4.0:
         ratio = 0.6
+        
+    # Đi thẳng (Góc < 4 độ) -> Phóng nhanh (100% tốc độ thay vì 90% như cũ)
     else:
-        ratio = 0.9
+        ratio = 1.0 
+        
     return max_speed * ratio
 
 
