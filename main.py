@@ -53,7 +53,7 @@ ERROR_SMOOTHING_ALPHA = 0.4
 # Giới hạn góc lái được phép thay đổi tối đa giữa 2 frame liên tiếp (độ/frame).
 # Lớp bảo vệ cuối: dù error có nhảy vọt bất thường vì lý do gì, góc lái thực
 # tế gửi xuống xe vẫn không thể "giật" đột ngột.
-MAX_ANGLE_DELTA_PER_FRAME = 12.0
+MAX_ANGLE_DELTA_PER_FRAME = 20.0
 
 # Bán kính cửa sổ tìm kiếm biên đường (tỉ lệ theo bề rộng ảnh), quanh vị trí
 # mục tiêu của frame TRƯỚC. Giúp "phớt lờ" nhánh rẽ tại ngã ba/ngã tư thay vì
@@ -90,7 +90,7 @@ DEBUG_DIR = "debug_frames"
 
 # Vì bản headless không có phím 'q' để dừng thủ công, tự dừng sau thời gian này
 # (giây) để tránh chạy vô hạn khi bạn quên tắt. Đặt None để chạy vô hạn (không tự dừng).
-MAX_RUNTIME_SEC = 300
+MAX_RUNTIME_SEC = 420
 
 # Tắt hiển thị debug khi chạy thi đấu chính thức -> giảm overhead, an toàn hơn cho
 # giới hạn FPS 60 của máy chấm. Chỉ bật True nếu máy đang chạy CÓ giao diện đồ họa
@@ -149,11 +149,13 @@ def main():
     baseline_width = None      # bề rộng đường "bình thường" trung bình (EMA),
                                 # dùng để phát hiện đường đột ngột phình to
 
+    # Biến quản lý chế độ giữ lái
+    IS_PIVOTING = False
+    pivot_start_time = 0.0
+    pivot_angle = 0.0
+
     # Tần suất in thông tin terminal
     PRINT_EVERY = 5
-
-    fps_window = []
-    FPS_LOG_EVERY = 60
 
     if SAVE_DEBUG_EVERY:
         os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -163,19 +165,25 @@ def main():
         live_viewer = LiveViewer(port=LIVE_VIEW_PORT)
         live_viewer.start()
 
-    print("[UCR 2026] Bắt đầu điều khiển xe.")
-    if DEBUG_DISPLAY:
-        print("[UCR 2026] Nhấn 'q' trên cửa sổ camera để dừng.")
-    else:
-        print("[UCR 2026] Chế độ headless - nhấn Ctrl+C để dừng"
-              + (f", hoặc tự dừng sau {MAX_RUNTIME_SEC}s." if MAX_RUNTIME_SEC else " (chạy vô hạn)."))
-        if SAVE_DEBUG_EVERY:
-            print(f"[UCR 2026] Ảnh debug sẽ lưu vào '{DEBUG_DIR}/' mỗi {SAVE_DEBUG_EVERY} frame.")
+    # IN THÔNG BÁO SẴN SÀNG KHI CHẠY PYTHON MAIN.PY
+    print("\n==============================================")
+    print("                 SAN SANG                     ")
+    print("==============================================")
 
     try:
         while True:
-            if MAX_RUNTIME_SEC and (time.time() - run_start_time) >= MAX_RUNTIME_SEC:
-                print(f"[UCR 2026] Đã chạy đủ {MAX_RUNTIME_SEC}s, tự dừng.")
+            # 1. LẤY ẢNH TỪ UNITY
+            raw_image = GetRaw()
+
+            # BẢO VỆ CHỐNG CRASH: Nếu chưa bấm AV Mode hoặc bị rớt frame (raw_image is None)
+            if raw_image is None or not isinstance(raw_image, np.ndarray) or raw_image.size == 0:
+                AVControl(0.0, 0.0)
+                time.sleep(0.02)
+                continue
+
+            # 3. ĐẾM THỜI GIAN THI ĐẤU (Bắt đầu tính từ lúc bấm AV Mode, tối đa 7 phút)
+            if MAX_RUNTIME_SEC and run_start_time and (time.time() - run_start_time) >= MAX_RUNTIME_SEC:
+                print(f"[UCR 2026] Đã hết thời gian thi đấu ({MAX_RUNTIME_SEC}s / 7 phút), tự dừng.")
                 break
 
             now = time.time()
@@ -233,18 +241,23 @@ def main():
             # ========================================================
             EMERGENCY_ERROR = 40.0  # Ngưỡng báo động đỏ (lệch trên 45 pixel)
             
-            if abs(error) > EMERGENCY_ERROR:
-                # 1. Bóp phanh đi cực chậm (chỉ 3.0 - 5.0) để triệt tiêu quán tính
-                speed = 0.0
-                
-                # 2. Ép vô lăng xoay kịch kim (bỏ qua mọi giới hạn làm mượt)
-                # Nếu error < 0 (lệch trái) -> bẻ hết lái trái. Ngược lại bẻ phải.
-                angle = -20 if error < 0 else 20
-                
-                # 3. Cập nhật lại bộ nhớ để khi thoát trạng thái này xe không bị giật
-                last_angle = angle
-                pid_steer.reset()       # Reset bộ nhớ PID
-                error_smoother.reset()  # Reset bộ nhớ chống nhiễu
+            # 1. Kích hoạt bộ đếm 3 giây nếu gặp sai số lớn và chưa ở trong chế độ pivot
+            if abs(error) > EMERGENCY_ERROR and not IS_PIVOTING:
+                IS_PIVOTING = True
+                pivot_start_time = time.time()
+                pivot_angle = -18 if error < 0 else 18
+
+            # 2. Duy trì trạng thái phanh + bẻ lái trong đúng 0.4 giây
+            if IS_PIVOTING:
+                elapsed_time = time.time() - pivot_start_time
+                if elapsed_time < 0.25:
+                    speed = 2.0
+                    angle = pivot_angle
+                else:
+                    # Hết 3 giây: Tắt chế độ pivot, reset PID để chạy lại bình thường
+                    IS_PIVOTING = False
+                    pid_steer.reset()
+                    error_smoother.reset()
             # ========================================================
 
             speed, angle = clip_control(speed, angle, MAX_SPEED, MAX_ANGLE)
@@ -263,16 +276,6 @@ def main():
                     f"Lost: {lost_frame_count}"
                     f"{spike_tag}"
                 )
-
-            # ---- Theo dõi FPS thực tế ----
-            frame_time = time.time() - now
-            fps_window.append(frame_time)
-            if len(fps_window) >= FPS_LOG_EVERY:
-                avg_time = sum(fps_window) / len(fps_window)
-                avg_fps = 1.0 / avg_time if avg_time > 0 else float("inf")
-                status = "OK" if avg_fps >= 55 else "CẢNH BÁO - có thể không đáp ứng kịp 60 FPS"
-                print(f"[FPS] Trung bình {avg_fps:.1f} FPS trong {FPS_LOG_EVERY} frame gần nhất ({status})")
-                fps_window = []
 
             # ---- Tính overlay debug cho live view / lưu file ----
             need_overlay = (
